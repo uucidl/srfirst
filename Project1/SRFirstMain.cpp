@@ -218,12 +218,11 @@ WinMain(
     VERIFY(menu_stack.size() == 1);
   }
 
-  auto Window = ::CreateWindowW(Class.lpszClassName, L"SRFirst", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, main_menu, nullptr, 0);
+  auto Window = ::CreateWindowW(Class.lpszClassName, L"SRFirst", WS_CLIPCHILDREN|WS_GROUP|WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, main_menu, nullptr, 0);
   VERIFY(Window);
   g_hwnd = Window;
-  VERIFY(::ShowWindow(Window, SW_SHOWNORMAL) == 0);
-  ::SetFocus(Window);
   ui_describe();
+  VERIFY(::ShowWindow(Window, SW_SHOWNORMAL) == 0);
 
   for (;;) {
     MSG msg;
@@ -320,7 +319,13 @@ main_window_proc(
       return 0;
     } break;
     case WM_KILLFOCUS: { log("WM_KILLFOCUS received towards %ul\n", ULONG(wParam));  } break;
-    case WM_SETFOCUS: {  log("WM_SETFOCUS received\n");   } break;
+    case WM_SETFOCUS: {
+      log("WM_SETFOCUS received\n");
+      // Adding a caret, because I thought this might help Narrator follow us. It seems it does not.
+      VERIFY(::CreateCaret(hwnd, (HBITMAP) nullptr, 0, 8 /* TODO(nil): DPI */));
+      VERIFY(::SetCaretPos(2, 2));
+      VERIFY(::ShowCaret(hwnd));
+    } break;
   }
   return ::DefWindowProcW(hwnd, uMsg, wParam, lParam);
 }
@@ -336,6 +341,7 @@ struct UiTree {
       kText,
       kDocument,
       kButton,
+      kPane,
   };
 
   // Nodes with their properties as separate arrays, APL-style.
@@ -358,7 +364,7 @@ valid_id(UiTree::Id id) {
 }
 
 void ui_set_focus_to(UiTree::Id id);
-void ui_activate(UiTree::Id);
+bool ui_activate(UiTree::Id);
 
 static UiTree g_ui;
 
@@ -713,6 +719,7 @@ AnyElementProvider::GetPatternProvider(PATTERNID patternId, IUnknown** pRetVal) 
   switch (patternId) {
   case UIA_ValuePatternId: { pattern = "Value";  } break;
   case UIA_TextPatternId: { pattern = "Text";  } break;
+  case UIA_TextPattern2Id: { pattern = "Text2";  } break;
   case UIA_InvokePatternId: { pattern = "Invoke"; } break;
   case UIA_ExpandCollapsePatternId: { pattern = "ExpandCollapse"; } break;
   case UIA_GridItemPatternId: { pattern = "GridItem"; } break;
@@ -769,6 +776,7 @@ AnyElementProvider::GetPropertyValue(PROPERTYID propertyId, VARIANT* pRetVal) {
     case UiTree::Type::kText: { pRetVal->lVal = UIA_TextControlTypeId; } break;
     case UiTree::Type::kDocument: { pRetVal->lVal = UIA_DocumentControlTypeId; } break;
     case UiTree::Type::kButton: { pRetVal->lVal = UIA_ButtonControlTypeId;  } break;
+    case UiTree::Type::kPane: { pRetVal->lVal = UIA_PaneControlTypeId; } break;
     default: VERIFY(0); // Implement this missing type
     }
     propname = "ControlType";
@@ -1210,7 +1218,7 @@ struct AnyElementInvokeProvider : public IInvokeProvider {
 HRESULT 
 AnyElementInvokeProvider::Invoke() {
   log("%s\n", __func__);
-  ui_activate(this->id);
+  VERIFY(ui_activate(this->id));
   return S_OK;
 }
 
@@ -1332,23 +1340,33 @@ ui_button(wchar_t const* text, std::function<void()> action) {
   return id;
 }
 
+UiTree::Id
+ui_pane(wchar_t const* text) {
+  return ui_named_element(text, UiTree::Type::kPane);
+}
+
 void
 ui_describe() {
   log("ui_describe: START\n");
   UiTree::Id fid = {};
-  ui_document(L"Main");
+  
+  ui_pane(L"Main");
   {
     g_ui.depth_for_adding_element++;
+    ui_document(L"Main");
+    {
+      g_ui.depth_for_adding_element++;
 
-    ui_text_paragraph(L"This is the first paragraph.");
-    fid = ui_text_paragraph(L"Hello, Dreamer of dreams.");
-    ui_text_paragraph(L"Yet another paragraph");
- 
+      ui_text_paragraph(L"This is the first paragraph.");
+      fid = ui_text_paragraph(L"Hello, Dreamer of dreams.");
+      ui_text_paragraph(L"Yet another paragraph");
+
+      g_ui.depth_for_adding_element--;
+    }
+    ui_button(L"Minimize Application", []() { VERIFY(::CloseWindow(g_hwnd)); });
+    ui_button(L"Close Application", []() { ::SendMessage(g_hwnd, WM_CLOSE, 0, 0); }); // A thread cannot use DestroyWindow to destroy a window created by a different thread.
     g_ui.depth_for_adding_element--;
   }
-  ui_button(L"Minimize Application", []() { VERIFY(::CloseWindow(g_hwnd)); });
-  ui_button(L"Close Application", []() { ::SendMessage(g_hwnd, WM_CLOSE, 0, 0); }); // A thread cannot use DestroyWindow to destroy a window created by a different thread.
-
   log("ui_describe: END\n");
 
   log("g_ui.node_ids.size() = %zu\n", g_ui.node_ids.size());
@@ -1420,6 +1438,7 @@ ui_set_focus_to(UiTree::Id id) {
         return;
     }
     log("changing focus from %#llx to %#llx\n", g_ui.focused_id, id);
+    ::SetActiveWindow(g_hwnd);
     g_ui.focused_id = id;
     if (UiaClientsAreListening() && g_root_provider) {
         auto p = create_element_provider(g_ui.focused_id);
@@ -1431,12 +1450,22 @@ ui_set_focus_to(UiTree::Id id) {
     }
 }
 
-void
+bool
 ui_activate(UiTree::Id id) {
   log("activating %#llx\n", id);
   auto action_pos = g_ui.actions.find(id);
-  VERIFY(action_pos != g_ui.actions.end());
+  if (action_pos == g_ui.actions.end()) return false;
 
   auto fn = action_pos->second;
   fn();
+
+  if (UiaClientsAreListening() && g_root_provider) {
+    auto p = create_element_provider(g_ui.focused_id);
+    IRawElementProviderSimple* sp;
+    VERIFYHR(p->QueryInterface<IRawElementProviderSimple>(&sp));
+    VERIFYHR(UiaRaiseAutomationEvent(sp, UIA_Invoke_InvokedEventId));
+    p->Release();
+    sp->Release();
+  }
+  return true;
 }
