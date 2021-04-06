@@ -3,6 +3,11 @@
 // An experiment in designing an app starting first from screen-reader support, before thinking about the GUI.
 //
 
+// Q. Why isn't NVDA somehow intercepting my Up/Down arrow key to change focus? (I thought that was what it was doing)
+// Q. Why isn't NVDA somehow updating when I change focus and raise the notification? (No blue highlight moving, no announcement)
+//   -> I forgot to implement: UIA_HasKeyboardFocusPropertyId
+//   -> This article helped me: https://www.codemag.com/article/0810112/Writing-a-UI-Automation-Provider-for-a-Win32-based-Custom-Control
+
 // First test it with the Accessibility Insight for Windows app, then test it with a screen-reader such as NVDA, Jaws or Narrator.
 //
 // I initially thought that elements shall have no graphical representation at all on the screen. It must be noted however that screen-readers do use the Mouse to select on hover certain elements. A visually-impaired user might use this to "feel" and "scan" the user interface. So probably elements should nevertheless have a position and take some amount of space, and allocate individual space for individual elements to give them a unique presence.
@@ -26,6 +31,18 @@
 // When I am not in scan mode, when I press (Caps_Lock + R) to read, it overrides the default focused element by calling SetFocus to start from its own idea of where to start. Why?
 //
 // NVDA too seems to not always follow my app's notion of focus, and I don't know why. I often have to forcefully Press Alt once to move to the system menu, then Alt again to move back from it to make the main pane the active one.
+
+// NVDA
+// ----
+//
+// Browse mode vs Focus mode.
+//
+// "NVDA uses the focused object to determine whether it should switch to focus mode."
+
+// Some interesting references
+// ---------------------------
+//
+// URL(https://www.accessibility-developer-guide.com/knowledge/screen-readers/desktop/browse-focus-modes/)
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -58,7 +75,7 @@
 #define STRINGIFY(s) STRINGIFY_INNER(s)
 #define VERIFY(expr) do { auto r = (expr); if (!bool(r)) { \
   auto LastError = GetLastError(); auto LastErrorAsHRESULT = HRESULT_FROM_WIN32(LastError); \
-  log("%s:%d: VERIFY(%s) failed. (GetLastError() returns %#x)\n", __FILE__, __LINE__, STRINGIFY(expr), LastErrorAsHRESULT); \
+  ::log("%s:%d: VERIFY(%s) failed. (GetLastError() returns %#x)\n", __FILE__, __LINE__, STRINGIFY(expr), LastErrorAsHRESULT); \
   if (::IsDebuggerPresent()) { ::DebugBreak(); } \
   std::exit(1); \
 } } while(0)
@@ -79,7 +96,7 @@ void
 log(char const* fmt, ...) {
   std::va_list args;
   va_start(args, fmt);
-  logv(fmt, args);
+  ::logv(fmt, args);
   va_end(args);
 }
 
@@ -92,6 +109,22 @@ bits(uint64_t x, uint64_t start, uint64_t num) {
 uint64_t
 hash(size_t num_bytes, void const* bytes) {
   return wyhash(bytes, num_bytes, 0, _wyp);
+}
+
+RECT
+intersection(RECT const a, RECT const b) {
+  return {
+    .left = std::max(a.left, b.left), .top = std::max(a.top, b.top),
+    .right = std::min(a.right, b.right), .bottom = std::max(a.bottom, b.bottom),
+  };
+}
+
+RECT
+operator+ (RECT const a, POINT b) {
+  return {
+    .left = a.left + b.x, .top = a.top + b.y,
+    .right = a.right + b.x, .bottom = a.bottom + b.y,
+  };
 }
 
 // 2. Actual program
@@ -155,6 +188,54 @@ void ui_focus_next();
 void ui_focus_prev();
 void ui_activate();
 
+struct UiTree {
+  using Id = std::uint64_t;
+  // Id == -1 => invalid_id
+  // Id == 0  => root
+  // ...
+
+  enum class Type {
+    kNone,
+    kText,
+    kDocument,
+    kButton,
+    kPane,
+  };
+
+  // Nodes with their properties as separate arrays, APL-style.
+  std::vector<Id>           node_ids; // in presentation order.
+  std::vector<std::wstring> node_names;
+  std::vector<Type>         node_type;
+  std::vector<Id>           node_parent;
+  std::vector<int>          node_depth;
+  std::vector<size_t>       node_text_len; // total length of the text found within this node including its children.
+
+  std::vector<RECT> node_rect;
+
+  std::unordered_map<Id, std::function<void()>> actions;
+  std::unordered_map<Id, IRawElementProviderFragment*> providers;
+
+  Id focused_id = 0;
+
+  int depth_for_adding_element = 0;
+};
+
+bool
+valid_id(UiTree::Id id) {
+  return 0 < id && id < UiTree::Id(-1);
+}
+
+void ui_set_focus_to(UiTree::Id id);
+bool ui_activate(UiTree::Id);
+bool ui_is_ancestor(UiTree::Id candidate_ancestor_id, UiTree::Id of_id);
+
+static UiTree g_ui;
+
+bool
+exists_id(UiTree::Id id) {
+  return valid_id(id) && g_ui.node_ids.end() != std::find(g_ui.node_ids.begin(), g_ui.node_ids.end(), id);
+}
+
 int __stdcall
 WinMain(
   HINSTANCE hInstance,
@@ -169,7 +250,6 @@ WinMain(
   }
   log("START: Starting SRFirst\n");
   VERIFYHR(::CoInitializeEx(NULL, COINIT_APARTMENTTHREADED));
-  
   WNDCLASSW Class = {
     .lpfnWndProc = main_window_proc,
     .lpszClassName = L"SRFirstMainClass",
@@ -231,11 +311,14 @@ WinMain(
     case 0: goto end; // WM_QUIT was received.
     default: break;
     }
-    TranslateMessage(&msg);
+    ::TranslateMessage(&msg);
     ::DispatchMessageW(&msg);
   }
 end:
   VERIFYHR(::UiaDisconnectAllProviders());
+  for (auto& x : g_ui.providers) {
+    VERIFY(x.second->Release() == 0);
+  }
   if (g_root_provider) {
       VERIFY(g_root_provider->Release() == 0);
       g_root_provider = nullptr;
@@ -244,6 +327,7 @@ end:
   log("END: Ended.\n");
   return 0;
 }
+
 
 LRESULT CALLBACK
 main_window_proc(
@@ -270,7 +354,7 @@ main_window_proc(
     case WM_COMMAND: {
       log("WM_COMMAND received with command: %#lx\n", long(wParam));
       switch ((MenuId)LOWORD(wParam)) {
-      case MenuId_File_Quit: ::DestroyWindow(g_hwnd); return 0;
+      case MenuId_File_Quit: ::DestroyWindow(g_hwnd); return 0; break;
       }
       
     } break;
@@ -286,7 +370,7 @@ main_window_proc(
 
       default: break;
       }
-    } 
+    } break;
     case WM_KEYDOWN: {
       if (0 == ((lParam >> 30) & 1 /* first transition bit*/)) {
         switch (wParam) {
@@ -302,6 +386,14 @@ main_window_proc(
             ui_focus_next();
           }
           return 0;
+        } break;
+        case VK_DOWN: {
+          log("User pressed <Down> to change focus.\n");
+          ui_focus_next();
+        } break;
+        case VK_UP: {
+          log("User pressed <Up> to change focus.\n");
+          ui_focus_prev();
         } break;
         case VK_RETURN: {
           log("User pressed <Return> to activate primary action.\n");
@@ -330,56 +422,45 @@ main_window_proc(
   return ::DefWindowProcW(hwnd, uMsg, wParam, lParam);
 }
 
-struct UiTree {
-  using Id = std::uint64_t;
-  // Id == -1 => invalid_id
-  // Id == 0  => root
-  // ...
-
-  enum class Type {
-      kNone,
-      kText,
-      kDocument,
-      kButton,
-      kPane,
-  };
-
-  // Nodes with their properties as separate arrays, APL-style.
-  std::vector<Id>           node_ids; // in presentation order.
-  std::vector<std::wstring> node_names;
-  std::vector<Type>         node_type;
-  std::vector<Id>           node_parent;
-  std::vector<int>          node_depth;
-
-  std::unordered_map<Id, std::function<void()>> actions;
-
-  Id focused_id = 0;
-
-  int depth_for_adding_element = 0;
-};
-
-bool
-valid_id(UiTree::Id id) {
-  return 0 < id && id < UiTree::Id(-1);
-}
-
-void ui_set_focus_to(UiTree::Id id);
-bool ui_activate(UiTree::Id);
-
-static UiTree g_ui;
-
-bool
-exists_id(UiTree::Id id) {
-  return valid_id(id) && g_ui.node_ids.end() != std::find(g_ui.node_ids.begin(), g_ui.node_ids.end(), id);
-}
-
-
 IRawElementProviderFragment* create_element_provider(UiTree::Id element_id);
+IRawElementProviderSimple* create_simple_element_provider(UiTree::Id element_id);
 ITextProvider* create_element_text_provider(UiTree::Id element_id);
 IValueProvider* create_element_value_provider(UiTree::Id element_id);
 IInvokeProvider* create_element_invoke_provider(UiTree::Id element_id);
 
 size_t ui_get_index(UiTree::Id element_id);
+size_t ui_get_parent_index(UiTree::Id id);
+
+// TODO(nil): review TextPoint and ranges:
+//
+// This representation is awkward because it has two potential termination for a right exclusive range:
+// 
+// Either the same id with offset == length of text in element or
+// the next id with offset = 0
+//
+// Only the latter would make the loops natural. However we don't have an id to provide for the last element.
+//
+// One idea is to define ranges for each element in the g_ui arrays, so that we can use a single integer to represent a range.
+//
+// There'd be still an ambiguity about the end of which element we mean, but this could be fixed by using `depth` (which might map nicely to the TextUnit concept)
+//
+struct TextPoint {
+  UiTree::Id id = (uint64_t)-1;
+  int offset = 0;
+
+  friend bool operator==(TextPoint const a, TextPoint const b) {
+    return a.id == b.id && a.offset == b.offset;
+  }
+
+  friend std::strong_ordering operator<=>(TextPoint const a, TextPoint const b) {
+    if (a.id == b.id) { return a.offset <=> b.offset; }
+    return ui_get_index(a.id) <=> ui_get_index(b.id); // TODO(nil): implement enclosure logic. I.e. a document surrounds the text that it contains, so there must be a way to say, place the end point at the end of the enclosing document or at the beginning of the document. Which means that a document surrounds its text and can't logically be compared simply with the index.
+  }
+};
+
+
+ITextRangeProvider* create_text_range(TextPoint start, TextPoint end);
+
 
 HRESULT
 RootProvider::QueryInterface(REFIID riid, void** ppvObject) {
@@ -401,7 +482,7 @@ RootProvider::QueryInterface(REFIID riid, void** ppvObject) {
 
   LPOLESTR riid_string;
   VERIFYHR(::StringFromIID(riid, &riid_string));
-  log("%s %u (%ls)\n", __func__, riid, riid_string);
+  log("%s %u (%ls)\n", __func__, riid.Data1, riid_string);
   if (!ppvObject) return E_POINTER;
 
   *ppvObject = result.second; // it's important to also assign it a value even if E_NOTINTERFACE
@@ -460,6 +541,12 @@ RootProvider::GetPropertyValue(PROPERTYID propertyId, VARIANT* pRetVal) {
     pRetVal->vt = VT_BSTR;
     pRetVal->bstrVal = ::SysAllocString(L"UU::AnyElementProvider");
   } break;
+
+  case UIA_HasKeyboardFocusPropertyId: {
+    pRetVal->vt = VT_BOOL;
+    pRetVal->boolVal = g_ui.focused_id == 0 ? VARIANT_TRUE : VARIANT_FALSE;
+  } break;
+
   }
   return S_OK;
 }
@@ -548,7 +635,7 @@ RootProvider::Navigate(NavigateDirection direction, IRawElementProviderFragment*
   }
 
   if (valid_id(element_id)) {
-    *pRetVal = create_element_provider(element_id); // TODO(nil): cache it somehow. 
+    *pRetVal = create_element_provider(element_id);
   }
 
   return S_OK;
@@ -583,7 +670,29 @@ RootProvider::ElementProviderFromPoint(double x, double y, IRawElementProviderFr
   if (!pRetVal) return E_POINTER;
   *pRetVal = nullptr;
 
-  if (g_ui.focused_id) {
+  POINT LeftTop = { .x = 0, .y = 0 };
+  VERIFY(::ClientToScreen(g_hwnd, &LeftTop));
+
+  x -= LeftTop.x;
+  y -= LeftTop.y;
+
+  auto depth = 0;
+  UiTree::Id id = 0;
+  for (size_t i = 0; i < g_ui.node_rect.size(); i++) {
+    auto d = g_ui.node_depth[i];
+    if (d < depth) continue;
+    auto r = g_ui.node_rect[i];
+    if (y < r.top) continue;
+    if (y >= r.bottom) continue;
+    if (x < r.left) continue;
+    if (x >= r.right) continue;
+    depth = d;
+    id = g_ui.node_ids[i];
+  }
+
+  log("  Found element %#llx at depth %d\n", id, depth);
+
+  if (id) {
       *pRetVal = create_element_provider(g_ui.focused_id);
   }
   else {
@@ -646,7 +755,7 @@ AnyElementProvider::QueryInterface(REFIID riid, void** ppvObject) {
 
   LPOLESTR riid_string;
   VERIFYHR(::StringFromIID(riid, &riid_string));
-  log("%s %u (%ls)\n", __func__, riid, riid_string);
+  log("%s %u (%ls)\n", __func__, riid.Data1, riid_string);
   if (!ppvObject) return E_POINTER;
 
   *ppvObject = result.second; // it's important to also assign it a value even if E_NOTINTERFACE
@@ -696,6 +805,8 @@ AnyElementProvider::GetPatternProvider(PATTERNID patternId, IUnknown** pRetVal) 
     else if (patternId == UIA_ValuePatternId) {
       *pRetVal = create_element_value_provider(this->id);
     }
+  } break;
+
   case UiTree::Type::kText: {
     if (patternId == UIA_TextPatternId) {
       *pRetVal = create_element_text_provider(this->id);
@@ -706,7 +817,6 @@ AnyElementProvider::GetPatternProvider(PATTERNID patternId, IUnknown** pRetVal) 
         *pRetVal = create_element_value_provider(this->id);
       }
     }
-  }
   } break;
 
   case UiTree::Type::kButton : {
@@ -814,6 +924,8 @@ AnyElementProvider::GetPropertyValue(PROPERTYID propertyId, VARIANT* pRetVal) {
 
   case UIA_NativeWindowHandlePropertyId: {
     propname = "NativeWindowHandle";
+    pRetVal->vt = VT_I4;
+    pRetVal->lVal = 0;
   } break;
   case UIA_FrameworkIdPropertyId: { propname = "FrameworkId";  } break;
   case UIA_AutomationIdPropertyId: { propname = "AutomationId";  } break;
@@ -830,6 +942,12 @@ AnyElementProvider::GetPropertyValue(PROPERTYID propertyId, VARIANT* pRetVal) {
     pRetVal->vt = VT_BSTR;
     pRetVal->bstrVal = ::SysAllocString(L"UU::RootProvider");
     propname = "ClassNameDescription";
+  } break;
+
+  case UIA_HasKeyboardFocusPropertyId: {
+    pRetVal->vt = VT_BOOL;
+    pRetVal->boolVal = g_ui.focused_id == this->id ? VARIANT_TRUE : VARIANT_FALSE;
+    propname = "HasKeyboardFocus";
   } break;
 
   }
@@ -849,8 +967,8 @@ AnyElementProvider::get_BoundingRectangle(UiaRect* pRetVal) {
   log("%s\n", __func__);
   // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-irawelementproviderfragment-get_boundingrectangle)
   if (!pRetVal) return E_INVALIDARG;
-  RECT ClientRect;
-  VERIFY(::GetClientRect(g_hwnd, &ClientRect));
+
+  RECT ClientRect = g_ui.node_rect[ui_get_index(this->id)];
   POINT LeftTop = { .x = ClientRect.left, .y = ClientRect.top };
   VERIFY(::ClientToScreen(g_hwnd, &LeftTop));
   pRetVal->left = double(LeftTop.x);
@@ -1057,7 +1175,7 @@ AnyElementValueProvider::QueryInterface(REFIID riid, void** ppvObject) {
 
   LPOLESTR riid_string;
   VERIFYHR(::StringFromIID(riid, &riid_string));
-  log("%s %u (%ls)\n", __func__, riid, riid_string);
+  log("%s %u (%ls)\n", __func__, riid.Data1, riid_string);
   if (!ppvObject) return E_POINTER;
 
   *ppvObject = result.second; // it's important to also assign it a value even if E_NOTINTERFACE
@@ -1080,7 +1198,7 @@ struct AnyElementTextProvider : public ITextProvider {
   HRESULT STDMETHODCALLTYPE GetSelection(SAFEARRAY** pRetVal) override;
   HRESULT STDMETHODCALLTYPE GetVisibleRanges(SAFEARRAY** pRetVal) override;
   HRESULT STDMETHODCALLTYPE RangeFromChild(IRawElementProviderSimple* childElement, ITextRangeProvider** pRetVal) override;
-  HRESULT RangeFromPoint(UiaPoint point, ITextRangeProvider** pRetVal) override;
+  HRESULT STDMETHODCALLTYPE RangeFromPoint(UiaPoint point, ITextRangeProvider** pRetVal) override;
 
   // IUnknown interface:
   ULONG STDMETHODCALLTYPE AddRef() override { return ++reference_count; }
@@ -1114,7 +1232,7 @@ AnyElementTextProvider::QueryInterface(REFIID riid, void** ppvObject) {
 
   LPOLESTR riid_string;
   VERIFYHR(::StringFromIID(riid, &riid_string));
-  log("%s %u (%ls)\n", __func__, riid, riid_string);
+  log("%s %u (%ls)\n", __func__, riid.Data1, riid_string);
   if (!ppvObject) return E_POINTER;
 
   *ppvObject = result.second; // it's important to also assign it a value even if E_NOTINTERFACE
@@ -1133,7 +1251,14 @@ AnyElementTextProvider::get_DocumentRange(ITextRangeProvider** pRetVal) {
   // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-itextprovider-get_documentrange)
   log("%s (unsupported)\n", __func__);
   if (!pRetVal) return E_INVALIDARG;
+
   *pRetVal = nullptr;
+
+  auto this_index = ui_get_index(this->id);
+  auto type = g_ui.node_type[this_index];
+  if (type == UiTree::Type::kDocument) {
+    *pRetVal = create_text_range({ .id = this->id, .offset = 0 }, { .id = this->id, .offset = static_cast<int>(g_ui.node_text_len[this_index]) });
+  }
   return S_OK;
 }
 
@@ -1177,7 +1302,7 @@ AnyElementTextProvider::RangeFromChild(IRawElementProviderSimple* childElement, 
   if (!childElement) return E_INVALIDARG;
   if (!pRetVal) return E_INVALIDARG;
 
-  auto p = dynamic_cast<AnyElementProvider*>(childElement);
+  auto p = dynamic_cast<AnyElementProvider*>(childElement); // NOTE(nil): this requires RTTI. We can avoid that by using QueryInterface, most likely.
   log("  id=%#llx\n", p->id);
   *pRetVal = nullptr;
   return E_NOTIMPL;
@@ -1192,6 +1317,529 @@ AnyElementTextProvider::RangeFromPoint(UiaPoint point, ITextRangeProvider** pRet
   log("  {%f %f}\n", point.x, point.y);
   *pRetVal = nullptr;
   return E_NOTIMPL;
+}
+
+struct AnyElementTextRangeProvider : public ITextRangeProvider {
+  // ITextRangeProvider:
+  // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nn-uiautomationcore-itextrangeprovider?f1url=%3FappId%3DDev16IDEF1%26l%3DEN-US%26k%3Dk(UIAUTOMATIONCORE%252FITextRangeProvider);k(ITextRangeProvider);k(DevLang-C%252B%252B);k(TargetOS-Windows)%26rd%3Dtrue)
+  HRESULT STDMETHODCALLTYPE AddToSelection() override;
+  HRESULT STDMETHODCALLTYPE Clone(ITextRangeProvider** pRetVal) override;
+  HRESULT STDMETHODCALLTYPE Compare(ITextRangeProvider* range, BOOL* pRetVal) override;
+  HRESULT STDMETHODCALLTYPE CompareEndpoints(TextPatternRangeEndpoint endpoint, ITextRangeProvider* targetRange, TextPatternRangeEndpoint targetEndpoint, int* pRetVal) override;
+  HRESULT STDMETHODCALLTYPE ExpandToEnclosingUnit(TextUnit unit) override;
+  HRESULT STDMETHODCALLTYPE FindAttribute(TEXTATTRIBUTEID attributeId, VARIANT val, BOOL backward, ITextRangeProvider** pRetVal) override;
+  HRESULT STDMETHODCALLTYPE FindText(BSTR text, BOOL backward, BOOL ignoreCase, ITextRangeProvider** pRetVal) override;
+  HRESULT STDMETHODCALLTYPE GetAttributeValue(TEXTATTRIBUTEID attributeId, VARIANT* pRetVal) override;
+  HRESULT STDMETHODCALLTYPE GetBoundingRectangles(SAFEARRAY** pRetVal) override;
+  HRESULT STDMETHODCALLTYPE GetChildren(SAFEARRAY** pRetVal) override;
+  HRESULT STDMETHODCALLTYPE GetEnclosingElement(IRawElementProviderSimple** pRetVal) override;
+  HRESULT STDMETHODCALLTYPE GetText(int  maxLength, BSTR* pRetVal) override;
+  HRESULT STDMETHODCALLTYPE Move(TextUnit unit, int count, int* pRetVal) override;
+  HRESULT STDMETHODCALLTYPE MoveEndpointByRange(TextPatternRangeEndpoint endpoint, ITextRangeProvider* targetRange, TextPatternRangeEndpoint targetEndpoint) override;
+  HRESULT STDMETHODCALLTYPE MoveEndpointByUnit(TextPatternRangeEndpoint endpoint, TextUnit unit, int count, int* pRetVal) override;
+  HRESULT STDMETHODCALLTYPE RemoveFromSelection() override;
+  HRESULT STDMETHODCALLTYPE ScrollIntoView(BOOL alignToTop) override;
+  HRESULT STDMETHODCALLTYPE Select() override;
+
+  // IUnknown interface:
+  ULONG STDMETHODCALLTYPE AddRef() override { return ++reference_count; }
+  ULONG STDMETHODCALLTYPE Release() override { return --reference_count; }
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
+
+  void log(char const* fmt, ...) {
+    ::log("this(%p, start_id=%#llx, start_offset=%d, end_id=%#llx, end_offset=%d) AnyElementTextRangeProvider::", this, this->start.id, this->start.offset, this->end.id, this->end.offset);
+    std::va_list args;
+    va_start(args, fmt);
+    ::logv(fmt, args);
+    va_end(args);
+  }
+
+  ULONG reference_count = 1;
+
+  TextPoint start;
+  TextPoint end;
+};
+
+ITextRangeProvider*
+create_text_range(TextPoint start, TextPoint end) {
+  auto p = new AnyElementTextRangeProvider;
+  p->start = start;
+  p->end = end;
+
+  return p;
+}
+
+HRESULT
+AnyElementTextRangeProvider::AddToSelection() {
+  log("%s\n", __func__);
+  // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-itextrangeprovider-addtoselection)
+  return E_UNEXPECTED;
+}
+
+HRESULT
+AnyElementTextRangeProvider::Clone(ITextRangeProvider** pRetVal) {
+  log("%s\n", __func__);
+  // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-itextrangeprovider-clone)
+  if (!pRetVal) return E_POINTER;
+
+  *pRetVal = create_text_range(this->start, this->end);
+  return S_OK;
+}
+
+HRESULT
+AnyElementTextRangeProvider::Compare(ITextRangeProvider* range, BOOL* pRetVal) {
+  log("%s\n", __func__);
+  // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-itextrangeprovider-compare)
+  if (!pRetVal) return E_POINTER;
+  if (!range) return E_POINTER;
+  auto other = dynamic_cast<AnyElementTextRangeProvider*>(range);
+  *pRetVal = other->start == this->start && other->end == this->end;
+  return S_OK;
+}
+
+HRESULT
+AnyElementTextRangeProvider::CompareEndpoints(TextPatternRangeEndpoint endpoint, ITextRangeProvider* targetRange, TextPatternRangeEndpoint targetEndpoint, int* pRetVal) {
+  log("%s\n", __func__);
+  // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-itextrangeprovider-compareendpoints)
+  if (!targetRange) return E_POINTER;
+  if (!pRetVal) return E_POINTER;
+  auto other = dynamic_cast<AnyElementTextRangeProvider*>(targetRange);
+
+  const auto get_endpoint = [](AnyElementTextRangeProvider* range, TextPatternRangeEndpoint kind) -> TextPoint {
+    switch (kind) {
+    case TextPatternRangeEndpoint_Start: return range->start;
+    case TextPatternRangeEndpoint_End: return range->end;
+    }
+    return {.id=0, .offset=0};
+  };
+
+  auto compare_result = get_endpoint(this, endpoint) <=> get_endpoint(other, targetEndpoint);
+  *pRetVal = 0;
+
+  if (compare_result == std::strong_ordering::less) {
+    *pRetVal = -1;
+  }
+  else if (compare_result == std::strong_ordering::equal) {
+    *pRetVal = 0;
+  }
+  else if (compare_result == std::strong_ordering::greater) {
+    *pRetVal = +1;
+  }
+  return S_OK;
+}
+
+HRESULT
+AnyElementTextRangeProvider::ExpandToEnclosingUnit(TextUnit unit) {
+  log("%s\n", __func__);
+  // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-itextrangeprovider-expandtoenclosingunit)
+
+  // TODO(nil): implement this..
+
+  // We'll implement a simpler version of this, by letting it expand it always to the full element..
+  auto new_start = TextPoint{ .id = this->start.id, .offset = 0 };
+  auto new_end = TextPoint{ .id = this->end.id, .offset = static_cast<int>(g_ui.node_names[ui_get_index(this->end.id)].size()) };
+
+  this->start = new_start;
+  this->end = new_end;
+  return S_OK;
+}
+
+HRESULT
+AnyElementTextRangeProvider::FindAttribute(TEXTATTRIBUTEID attributeId, VARIANT val, BOOL backward, ITextRangeProvider** pRetVal) {
+  log("%s\n", __func__);
+  // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-itextrangeprovider-findattribute)
+
+  // TODO(nil): we don't have attributes, so we're not implementing this yet.
+
+  return E_NOTIMPL;
+}
+
+HRESULT
+AnyElementTextRangeProvider::FindText(BSTR text, BOOL backward, BOOL ignoreCase, ITextRangeProvider** pRetVal) {
+  log("%s\n", __func__);
+  // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-itextrangeprovider-findtext)
+  if (!pRetVal) return E_POINTER;
+  if (!text) return E_POINTER;
+  if (backward) return E_NOTIMPL; // TODO(nil): implement backward search
+  if (ignoreCase) return E_NOTIMPL; // TODO(nil): implement ignoreCase
+
+  std::wstring search_text = text;
+
+  *pRetVal = nullptr;
+
+  auto id = this->start.id;
+  auto offset = this->start.offset;
+
+  auto end_id = this->end.id;
+  auto end_offset = this->end.offset;
+
+  bool reached_end = false;
+  bool found_match = false;
+
+  for (; !reached_end && !found_match;) {
+    auto i = ui_get_index(id);
+    auto pos = g_ui.node_names[i].find(search_text, offset); // this algorithm does not find text that crosses elements.
+
+    if (id == end_id) {
+      reached_end = pos == std::wstring::npos || (pos + search_text.size()) >= end_offset;
+    }
+
+    if (pos != std::wstring::npos && !reached_end) {
+      auto m_start = TextPoint{ .id = id, .offset = static_cast<int>(pos) };
+      auto m_end = TextPoint{ .id = id, .offset = static_cast<int>(pos + search_text.size()) };
+      *pRetVal = create_text_range(m_start, m_end);
+      found_match = true;
+    }
+
+    if (i + 1 < g_ui.node_ids.size()) {
+      id = g_ui.node_ids[i + 1];
+      offset = 0;
+    }
+    else {
+      reached_end = true;
+    }
+  }
+
+  return S_OK;
+}
+
+HRESULT
+AnyElementTextRangeProvider::GetAttributeValue(TEXTATTRIBUTEID attributeId, VARIANT* pRetVal) {
+  log("%s\n", __func__);
+  // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-itextrangeprovider-getattributevalue)
+  // TODO(nil): we don't have attributes yet.
+  return E_NOTIMPL;
+}
+
+HRESULT
+AnyElementTextRangeProvider::GetBoundingRectangles(SAFEARRAY** pRetVal) {
+  log("%s\n", __func__);
+  // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-itextrangeprovider-getboundingrectangles)
+
+  // @TAG(Copypasta)
+  RECT ClientRect;
+  VERIFY(::GetClientRect(g_hwnd, &ClientRect));
+  POINT LeftTop = { .x = ClientRect.left, .y = ClientRect.top };
+  VERIFY(::ClientToScreen(g_hwnd, &LeftTop));
+
+  std::vector<RECT> rects;
+  auto id = this->start.id;
+  auto reached_end = false;
+  for (; !reached_end;) {
+    auto i = ui_get_index(id);
+    // TODO(nil): what should happen when the node encloses others? It can't be a line then, and probably should be skipped?
+    auto r = intersection(g_ui.node_rect[i], ClientRect);
+    if (r.left <= r.right && r.top <= r.bottom) {
+      rects.push_back(r + LeftTop);
+    }
+    
+    if (id == this->end.id) {
+      reached_end = true;
+    }
+
+    if (i + 1 < g_ui.node_ids.size()) {
+      id = g_ui.node_ids[i + 1];
+    }
+    else {
+      reached_end = true;
+    }
+  }
+
+  if (!pRetVal) return E_POINTER;
+
+  // URL(https://docs.microsoft.com/en-us/windows/win32/winauto/uiauto-workingwithsafearrays)
+  SAFEARRAY* psa = ::SafeArrayCreateVector(VT_R8, 0, LONG(rects.size() * 4));
+  if (!psa) return E_OUTOFMEMORY;
+  for (size_t i = 0; i < rects.size(); i++) {
+    double x;
+    LONG idx = i*4;
+    x = rects[i].left; VERIFYHR(::SafeArrayPutElement(psa, &idx, &x)); idx += 1;
+    x = rects[i].top; VERIFYHR(::SafeArrayPutElement(psa, &idx, &x)); idx += 1;
+    x = rects[i].right; VERIFYHR(::SafeArrayPutElement(psa, &idx, &x)); idx += 1;
+    x = rects[i].bottom; VERIFYHR(::SafeArrayPutElement(psa, &idx, &x)); idx += 1;
+  }
+  
+  *pRetVal = psa;
+  return S_OK;
+}
+
+HRESULT
+AnyElementTextRangeProvider::GetChildren(SAFEARRAY** pRetVal) {
+  log("%s\n", __func__);
+  // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-itextrangeprovider-getchildren)
+
+  std::vector<IRawElementProviderSimple*> children;
+
+  bool reached_end = false;
+  auto id = this->start.id;
+  auto offset = this->start.offset;
+  for (; !reached_end;) {
+    // NOTE(nil): this loop (and many of the other ones) have to be updated as soon as there are non textual elements in the loop, which have to be skipped.
+    auto i = ui_get_index(id);
+    if (offset == 0) {
+      auto sp = create_simple_element_provider(g_ui.focused_id);
+      children.push_back(sp);
+    }
+
+    if (id == this->end.id) {
+      reached_end = true;
+    } else if (i + 1 >= g_ui.node_ids.size()) {
+      reached_end = true;
+    }
+    else {
+      id = g_ui.node_ids[i + 1];
+    }
+  }
+
+  if (!pRetVal) return E_POINTER;
+  SAFEARRAY* psa = ::SafeArrayCreateVector(VT_PTR, 0, LONG(children.size()));
+  if (!psa) return E_OUTOFMEMORY;
+
+  for (size_t i = 0; i < children.size(); i++) {
+    LONG idx = i;
+    VERIFYHR(::SafeArrayPutElement(psa, &idx, &children[i]));
+  }
+
+  *pRetVal = psa;
+  return S_OK;
+}
+
+HRESULT
+AnyElementTextRangeProvider::GetEnclosingElement(IRawElementProviderSimple** pRetVal) {
+  log("%s\n", __func__);
+  // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-itextrangeprovider-getenclosingelement)
+  if (!pRetVal) return E_POINTER;
+  if (this->start.id == this->end.id) {
+    *pRetVal = create_simple_element_provider(this->start.id);
+    return S_OK;
+  }
+
+  auto start_id = this->start.id;
+  auto end_id = this->end.id;
+
+  auto i = ui_get_index(start_id);
+  auto j = ui_get_index(end_id);
+  
+  while (g_ui.node_depth[i] < g_ui.node_depth[j]) {
+    i = ui_get_parent_index(start_id);
+    start_id = g_ui.node_ids[i];
+  }
+  while (g_ui.node_depth[j] < g_ui.node_depth[i]) {
+    j = ui_get_parent_index(end_id);
+    end_id = g_ui.node_ids[j];
+  }
+  VERIFY(g_ui.node_depth[i] == g_ui.node_depth[j]);
+  while (start_id != end_id) {
+    i = ui_get_parent_index(start_id);
+    start_id = g_ui.node_ids[i];
+    j = ui_get_parent_index(end_id);
+    end_id = g_ui.node_ids[j];
+  }
+  auto enclosing_id = start_id;
+  VERIFY(ui_is_ancestor(enclosing_id, this->start.id));
+  VERIFY(ui_is_ancestor(enclosing_id, this->end.id));
+
+  *pRetVal = create_simple_element_provider(enclosing_id);
+  return S_OK;
+}
+
+HRESULT
+AnyElementTextRangeProvider::GetText(int maxLength, BSTR* pRetVal) {
+  log("%s\n", __func__);
+  // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-itextrangeprovider-gettext)
+  if (!pRetVal) return E_POINTER;
+
+  *pRetVal = nullptr;
+
+  std::wstring text;
+  auto reached_end = false;
+  auto id = this->start.id;
+  auto offset = this->start.offset;
+  for (; !reached_end;) {
+    auto i = ui_get_index(id);
+    auto len = id == this->end.id ? this->end.offset - offset : g_ui.node_names[i].size();
+    text.append(g_ui.node_names[i], offset, len);
+    if (id == this->end.id) {
+      reached_end = true;
+    }
+    else if (i + 1 >= g_ui.node_ids.size()) {
+      reached_end = true;
+    }
+    else {
+      id = g_ui.node_ids[i + 1];
+      offset = 0;
+    }
+  }
+
+  auto normalized_max_len = maxLength < 0 ? text.size() : maxLength;
+
+  auto str = ::SysAllocStringLen(text.data(), std::min(text.size(), normalized_max_len));
+  if (!str) return E_OUTOFMEMORY;
+
+  *pRetVal = str;
+  return S_OK;
+}
+
+HRESULT
+AnyElementTextRangeProvider::Move(TextUnit unit, int count, int* pRetVal) {
+  log("%s\n", __func__);
+  // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-itextrangeprovider-move)
+
+  if (!pRetVal) return E_POINTER;
+
+  if (this->start == this->end) return S_OK;
+  
+  // For a non-degenerate (non-empty) text range, ITextRangeProvider::Move should normalize and move the text range by performing the following steps.
+  // 
+  // 1. Collapse the text range to a degenerate(empty) range at the starting endpoint.
+  auto this_id = this->start.id;
+  auto this_offset = this->start.offset;
+
+  // 2. If necessary, move the resulting text range backward in the document to the beginning of the requested unit boundary.
+  switch (unit) {
+  case TextUnit_Document: {
+    auto id = this_id;
+    auto index = ui_get_index(id);
+    while (id && g_ui.node_type[index] != UiTree::Type::kDocument) {
+      id = g_ui.node_parent[index];
+      index = ui_get_index(id);
+    }
+    if (id) {
+      this_id = id;
+      this_offset = 0;
+    }
+  } break;
+  case TextUnit_Page: break; // we don't have pages.
+  case TextUnit_Paragraph: {
+    auto id = this_id;
+    auto index = ui_get_index(id);
+    while (id && g_ui.node_type[index] != UiTree::Type::kText) {
+      id = g_ui.node_parent[index];
+      index = ui_get_index(id);
+    }
+    if (id) {
+      this_id = id;
+      this_offset = 0;
+    }
+  } break;
+  case TextUnit_Line: return E_NOTIMPL; // we don't have lines.
+  case TextUnit_Word: return E_NOTIMPL; // we don't have words.
+  case TextUnit_Character: return E_NOTIMPL; // we have characters, and that's all we have.
+  case TextUnit_Format: return E_NOTIMPL; // we don't have format/attributes.
+  }
+
+  // 3. Move the text range forward or backward in the document by the requested number of text unit boundaries.
+  struct AdvanceResult {
+    UiTree::Id new_id;
+    int steps_taken;
+  };
+
+  const auto advance_by_type = [](UiTree::Id id, int signed_count, UiTree::Type type) -> AdvanceResult {
+    auto index = ui_get_index(id);
+    VERIFY(g_ui.node_type[index] == type);
+    auto num_steps = abs(signed_count);
+    auto iinc = signed_count / num_steps;
+    auto steps = 0;
+    auto i = std::ptrdiff_t(index);
+    while (0 <= i && i < g_ui.node_ids.size() && steps < num_steps) {
+      if (g_ui.node_type[i] == type) {
+        id = g_ui.node_ids[i];
+        steps++;
+      }
+      i += iinc;
+    }
+    return { .new_id = id, .steps_taken = iinc * steps };
+  };
+
+  auto advance = AdvanceResult{ .new_id = this_id, .steps_taken = 0 };
+
+  switch (unit) {
+  case TextUnit_Document: {
+    advance = advance_by_type(this_id, count, UiTree::Type::kDocument);
+  } break;
+  case TextUnit_Page: break; // we don't have pages.
+  case TextUnit_Paragraph: {
+    advance = advance_by_type(this_id, count, UiTree::Type::kText);
+  } break;
+  case TextUnit_Line: return E_NOTIMPL; // we don't have lines.
+  case TextUnit_Word: return E_NOTIMPL; // we don't have words.
+  case TextUnit_Character: return E_NOTIMPL; // we have characters, and that's all we have.
+  case TextUnit_Format: return E_NOTIMPL; // we don't have format/attributes.
+  }
+
+  // 4. Expand the text range from the degenerate state by moving the ending endpoint forward by one requested text unit boundary.
+  auto new_start = TextPoint{ .id = advance.new_id, .offset = 0 };
+
+  // NOTE(nil): For now we'll pretend that our resolution is exactly one element, so we go until the end of that element.
+  auto new_end = TextPoint{ .id = new_start.id, .offset = static_cast<int>(g_ui.node_text_len[ui_get_index(new_start.id)]) };
+
+  this->start = new_start;
+  this->end = new_end;
+  return S_OK;
+}
+
+HRESULT
+AnyElementTextRangeProvider::MoveEndpointByRange(TextPatternRangeEndpoint endpoint, ITextRangeProvider* targetRange, TextPatternRangeEndpoint targetEndpoint) {
+  log("%s\n", __func__);
+  // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-itextrangeprovider-moveendpointbyrange)
+  return E_NOTIMPL;
+}
+
+HRESULT
+AnyElementTextRangeProvider::MoveEndpointByUnit(TextPatternRangeEndpoint endpoint, TextUnit unit, int count, int* pRetVal) {
+  log("%s\n", __func__);
+  // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-itextrangeprovider-moveendpointbyunit)
+  return E_NOTIMPL;
+}
+
+HRESULT
+AnyElementTextRangeProvider::RemoveFromSelection() {
+  log("%s\n", __func__);
+  // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-itextrangeprovider-removefromselection)
+  return E_NOTIMPL;
+}
+
+HRESULT
+AnyElementTextRangeProvider::ScrollIntoView(BOOL alignToTop) {
+  log("%s\n", __func__);
+  // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-itextrangeprovider-scrollintoview)
+  return E_NOTIMPL;
+}
+
+HRESULT
+AnyElementTextRangeProvider::Select() {
+  log("%s\n", __func__);
+  // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-itextrangeprovider-select)
+  return E_NOTIMPL;
+}
+
+HRESULT
+AnyElementTextRangeProvider::QueryInterface(REFIID riid, void** ppvObject) {
+  auto result = [&]() -> std::pair<char const*, void*> {
+    // supported interfaces:
+    if (riid == IID_ITextRangeProvider) return { "ITextRangeProvider", static_cast<ITextRangeProvider*>(this) };
+    return { nullptr, nullptr };
+  }();
+
+  if (riid == IID_IUnknown) {
+    // should always be supported
+    result = { "IUnknown", this };
+  }
+
+  LPOLESTR riid_string;
+  VERIFYHR(::StringFromIID(riid, &riid_string));
+  log("%s %u (%ls)\n", __func__, riid.Data1, riid_string);
+  if (!ppvObject) return E_POINTER;
+
+  *ppvObject = result.second; // it's important to also assign it a value even if E_NOTINTERFACE
+  if (!result.second) {
+    if (result.first) { log("  missing %s interface (not supported)\n", result.first); }
+    return E_NOINTERFACE;
+  }
+
+  AddRef();
+  log("  supported_interface %s\n", result.first);
+  return S_OK;
 }
 
 struct AnyElementInvokeProvider : public IInvokeProvider {
@@ -1237,7 +1885,7 @@ AnyElementInvokeProvider::QueryInterface(REFIID riid, void** ppvObject) {
 
   LPOLESTR riid_string;
   VERIFYHR(::StringFromIID(riid, &riid_string));
-  log("%s %u (%ls)\n", __func__, riid, riid_string);
+  log("%s %u (%ls)\n", __func__, riid.Data1, riid_string);
   if (!ppvObject) return E_POINTER;
 
   *ppvObject = result.second; // it's important to also assign it a value even if E_NOTINTERFACE
@@ -1255,10 +1903,28 @@ IRawElementProviderFragment*
 create_element_provider(UiTree::Id element_id) {
   VERIFY(exists_id(element_id));
 
+  auto& cache = g_ui.providers;
+  auto ep = cache.find(element_id);
+  if (ep != cache.end()) {
+    ep->second->AddRef();
+    return ep->second;
+  }
+
   auto p = new AnyElementProvider;
   p->id = element_id;
+  cache[p->id] = p;
+  cache[p->id]->AddRef();
 
   return p;
+}
+
+IRawElementProviderSimple*
+create_simple_element_provider(UiTree::Id element_id) {
+  auto p = create_element_provider(g_ui.focused_id);
+  IRawElementProviderSimple* sp;
+  VERIFYHR(p->QueryInterface<IRawElementProviderSimple>(&sp));
+  p->Release();
+  return sp;
 }
 
 ITextProvider*
@@ -1290,6 +1956,28 @@ create_element_invoke_provider(UiTree::Id element_id) {
   return p;
 }
 
+size_t
+ui_get_parent_index(UiTree::Id id) {
+  auto index = ui_get_index(id);
+  auto parent_id = g_ui.node_parent[index];
+  return ui_get_index(parent_id);
+}
+
+bool
+ui_is_ancestor(UiTree::Id candidate_ancestor_id, UiTree::Id of_id) {
+  auto id = of_id;
+
+  while (id != 0) {
+    auto index = ui_get_index(id);
+    auto parent_id = g_ui.node_parent[index];
+    if (parent_id == candidate_ancestor_id) return true;
+
+    id = parent_id;
+  }
+
+  return false;
+}
+
 UiTree::Id
 ui_named_element(wchar_t const* name, UiTree::Type type) {
   auto index = g_ui.node_ids.size();
@@ -1312,7 +2000,6 @@ ui_named_element(wchar_t const* name, UiTree::Type type) {
   auto id = hash(num_bytes, name);
   id = wyhash64(id, parent_id);
 
-  log("%*snode: %d %#llx (%ls)\n", int(depth), "", type, id, name);
   VERIFY(valid_id(id));
   VERIFY(g_ui.node_ids.end() == std::find(g_ui.node_ids.begin(), g_ui.node_ids.end(), id));
   g_ui.node_ids.push_back(id);
@@ -1320,6 +2007,18 @@ ui_named_element(wchar_t const* name, UiTree::Type type) {
   g_ui.node_type.push_back(type);
   g_ui.node_depth.push_back(depth);
   g_ui.node_parent.push_back(parent_id);
+  g_ui.node_rect.push_back({});
+  g_ui.node_text_len.push_back(0);
+
+  auto node_len = g_ui.node_names[index].size();
+
+  g_ui.node_text_len[index] = node_len;
+  for (auto parent_id = g_ui.node_parent[index]; parent_id; ) {
+    auto parent_index = ui_get_index(parent_id);
+    g_ui.node_text_len[parent_index] += node_len;
+
+    parent_id = g_ui.node_parent[parent_index];
+  }
   return id;
 }
 
@@ -1346,26 +2045,78 @@ ui_pane(wchar_t const* text) {
 }
 
 void
+ui_set_rect(UiTree::Id id, RECT rect) {
+  auto i = ui_get_index(id);
+  g_ui.node_rect.resize(std::max(g_ui.node_rect.size(), i + 1));
+  g_ui.node_rect[i] = rect;
+}
+
+void
 ui_describe() {
   log("ui_describe: START\n");
   UiTree::Id fid = {};
-  
-  ui_pane(L"Main");
-  {
-    g_ui.depth_for_adding_element++;
-    ui_document(L"Main");
-    {
-      g_ui.depth_for_adding_element++;
+ 
+  using Co = LONG;
+  const auto extend = [](RECT r, POINT p) -> RECT {
+    return {
+      .left = std::min(r.left, p.x),
+      .top = std::min(r.top, p.y),
+      .right = std::max(r.right, p.x),
+      .bottom = std::max(r.bottom, p.y),
+    };
+  };
 
-      ui_text_paragraph(L"This is the first paragraph.");
-      fid = ui_text_paragraph(L"Hello, Dreamer of dreams.");
-      ui_text_paragraph(L"Yet another paragraph");
+  Co width = 1200;
+  Co height = 20;
+
+  Co x = 0;
+  Co y = 0;
+
+  auto pane = ui_pane(L"Main");
+  {
+    RECT pane_rect = { x, y, x + width, y };
+
+    UiTree::Id id;
+
+    x += 10;
+    g_ui.depth_for_adding_element++;
+    auto document = ui_document(L"Main");
+    {
+      RECT document_rect = pane_rect;
+      
+      x += 10;
+      g_ui.depth_for_adding_element++;
+ 
+      id = ui_text_paragraph(L"This is the first paragraph.");
+      ui_set_rect(id, { .left = x, .top = y, .right = x + width, .bottom = y + height });
+      y += height;
+
+      fid = id = ui_text_paragraph(L"Hello, Dreamer of dreams.");
+      ui_set_rect(id, { .left = x, .top = y, .right = x + width, .bottom = y + height });
+      y += height;
+
+      id = ui_text_paragraph(L"Yet another paragraph");
+      ui_set_rect(id, { .left = x, .top = y, .right = x + width, .bottom = y + height });
+      y += height;
 
       g_ui.depth_for_adding_element--;
+      x -= 10;
+      document_rect = extend(document_rect, { x, y });
+      ui_set_rect(document, document_rect);
     }
-    ui_button(L"Minimize Application", []() { VERIFY(::CloseWindow(g_hwnd)); });
-    ui_button(L"Close Application", []() { ::SendMessage(g_hwnd, WM_CLOSE, 0, 0); }); // A thread cannot use DestroyWindow to destroy a window created by a different thread.
+
+    id = ui_button(L"Minimize Application", []() { VERIFY(::CloseWindow(g_hwnd)); });
+    ui_set_rect(id, { .left = x, .top = y, .right = x + width, .bottom = y + height });
+    y += height;
+
+    id = ui_button(L"Close Application", []() { ::SendMessage(g_hwnd, WM_CLOSE, 0, 0); }); // A thread cannot use DestroyWindow to destroy a window created by a different thread.
+    ui_set_rect(id, { .left = x, .top = y, .right = x + width, .bottom = y + height });
+    y += height;
     g_ui.depth_for_adding_element--;
+    x -= 10;
+
+    pane_rect = extend(pane_rect, { x, y });
+    ui_set_rect(pane, pane_rect);
   }
   log("ui_describe: END\n");
 
@@ -1375,6 +2126,17 @@ ui_describe() {
   if (g_ui.focused_id == 0 && !g_ui.node_ids.empty()) {
       ui_set_focus_to(fid);
   }
+
+  log("UI Tree:\n");
+  for (size_t i = 0; i < g_ui.node_ids.size(); i++) {
+    unsigned long long id = g_ui.node_ids[i];
+    int depth = g_ui.node_depth[i];
+    int type = (int)g_ui.node_type[i];
+    wchar_t* name = g_ui.node_names[i].data();
+    int len = g_ui.node_text_len[i];
+    log("%*snode: %d %#llx (%ls) len(%d)\n", 2+4*int(depth), "", type, id, name, len);
+  }
+  log("\n");
 }
 
 size_t
@@ -1441,11 +2203,8 @@ ui_set_focus_to(UiTree::Id id) {
     ::SetActiveWindow(g_hwnd);
     g_ui.focused_id = id;
     if (UiaClientsAreListening() && g_root_provider) {
-        auto p = create_element_provider(g_ui.focused_id);
-        IRawElementProviderSimple* sp;
-        VERIFYHR(p->QueryInterface<IRawElementProviderSimple>(&sp));      
+        auto sp = create_simple_element_provider(g_ui.focused_id);
         VERIFYHR(UiaRaiseAutomationEvent(sp, UIA_AutomationFocusChangedEventId));
-        p->Release();
         sp->Release();
     }
 }
@@ -1460,11 +2219,8 @@ ui_activate(UiTree::Id id) {
   fn();
 
   if (UiaClientsAreListening() && g_root_provider) {
-    auto p = create_element_provider(g_ui.focused_id);
-    IRawElementProviderSimple* sp;
-    VERIFYHR(p->QueryInterface<IRawElementProviderSimple>(&sp));
+    auto sp = create_simple_element_provider(g_ui.focused_id);
     VERIFYHR(UiaRaiseAutomationEvent(sp, UIA_Invoke_InvokedEventId));
-    p->Release();
     sp->Release();
   }
   return true;
