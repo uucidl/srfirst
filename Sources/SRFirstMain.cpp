@@ -1,4 +1,4 @@
-﻿// # SRFirst "Screen Reader First"
+﻿// # SRFirst App
 //
 // An experiment in designing an app starting first from screen-reader support, before thinking about the GUI.
 //
@@ -49,6 +49,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "wyhash.h"
+#include "SRFirstResources.h"
 
 #include <Windows.h>
 
@@ -173,7 +174,8 @@ static RootProvider* g_root_provider;
 
 enum MenuId : UINT {
   MenuId_None,
-  MenuId_File_Quit,
+  MenuId_File_Exit,
+  MenuId_Help_About,
 };
 
 LRESULT CALLBACK main_window_proc(
@@ -237,10 +239,10 @@ exists_id(UiTree::Id id) {
 }
 
 int __stdcall
-WinMain(
+wWinMain(
   HINSTANCE hInstance,
   HINSTANCE hPrevInstance,
-  LPSTR     lpCmdLine,
+  LPWSTR     lpCmdLine,
   int       nShowCmd
 ) {
   if (false) {
@@ -290,9 +292,12 @@ WinMain(
       };
       VERIFY(::InsertMenuItemW(menu_stack.back(), pos_stack.back()++, TRUE, &info));
     };
-    
+
     BeginTopLevelMenu(L"&File"); // & marks the mnemonic key used for keyboard access.
-    PushEntry(MenuId_File_Quit, L"&Quit");
+    PushEntry(MenuId_File_Exit, L"E&xit");
+    EndTopLevelMenu();
+    BeginTopLevelMenu(L"&Help");
+    PushEntry(MenuId_Help_About, L"&About");
     EndTopLevelMenu();
     
     VERIFY(menu_stack.size() == 1);
@@ -329,6 +334,15 @@ end:
 }
 
 
+INT_PTR about_dlgproc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+  switch (uMsg) {
+  case WM_INITDIALOG: return TRUE; // Necessary for mouse-less operation, otherwise <Return> does not dismiss the dialog.
+  case WM_COMMAND: VERIFY(::EndDialog(hwnd, 0));  return TRUE;
+  case WM_CLOSE:  VERIFY(::EndDialog(hwnd, 0));  return TRUE;
+  }
+  return FALSE;
+}
+
 LRESULT CALLBACK
 main_window_proc(
   _In_ HWND   hwnd,
@@ -354,7 +368,11 @@ main_window_proc(
     case WM_COMMAND: {
       log("WM_COMMAND received with command: %#lx\n", long(wParam));
       switch ((MenuId)LOWORD(wParam)) {
-      case MenuId_File_Quit: ::DestroyWindow(g_hwnd); return 0; break;
+      case MenuId_File_Exit: ::DestroyWindow(g_hwnd); return 0; break;
+      case MenuId_Help_About: {
+        ::DialogBoxW(nullptr, MAKEINTRESOURCE(IDD_ABOUT_DIALOG), hwnd, (DLGPROC)about_dlgproc);
+        return 0;
+      } break;
       }
       
     } break;
@@ -378,7 +396,7 @@ main_window_proc(
           log("User pressed <Tab> to change focus.\n");
           BYTE Keys[256];
           VERIFY(::GetKeyboardState(Keys));
-          if (Keys[VK_SHIFT] & (1 << 7)) {
+          if (Keys[VK_SHIFT] & (1<<7)) {
             log("  <Shift-Tab>\n");
             ui_focus_prev();
           }
@@ -2056,6 +2074,8 @@ ui_describe() {
   log("ui_describe: START\n");
   UiTree::Id fid = {};
  
+  constexpr auto kEnableUiRects = false; // the UI rects aren't necessary for the screen-reader to announce elements, unless users want a "tactile" feel using the mouse.
+
   using Co = LONG;
   const auto extend = [](RECT r, POINT p) -> RECT {
     return {
@@ -2078,45 +2098,46 @@ ui_describe() {
 
     UiTree::Id id;
 
-    x += 10;
+    if (kEnableUiRects) x += 10;
     g_ui.depth_for_adding_element++;
     auto document = ui_document(L"Main");
     {
       RECT document_rect = pane_rect;
       
-      x += 10;
+      if (kEnableUiRects) x += 10;
       g_ui.depth_for_adding_element++;
  
       id = ui_text_paragraph(L"This is the first paragraph.");
-      ui_set_rect(id, { .left = x, .top = y, .right = x + width, .bottom = y + height });
-      y += height;
+      fid = id;
+      if (kEnableUiRects) ui_set_rect(id, { .left = x, .top = y, .right = x + width, .bottom = y + height });
+      if (kEnableUiRects) y += height;
 
-      fid = id = ui_text_paragraph(L"Hello, Dreamer of dreams.");
-      ui_set_rect(id, { .left = x, .top = y, .right = x + width, .bottom = y + height });
-      y += height;
+      id = ui_text_paragraph(L"Hello, Dreamer of dreams.");
+      if (kEnableUiRects) ui_set_rect(id, { .left = x, .top = y, .right = x + width, .bottom = y + height });
+      if (kEnableUiRects) y += height;
 
       id = ui_text_paragraph(L"Yet another paragraph");
-      ui_set_rect(id, { .left = x, .top = y, .right = x + width, .bottom = y + height });
-      y += height;
+      if (kEnableUiRects) ui_set_rect(id, { .left = x, .top = y, .right = x + width, .bottom = y + height });
+      if (kEnableUiRects) y += height;
 
       g_ui.depth_for_adding_element--;
-      x -= 10;
-      document_rect = extend(document_rect, { x, y });
-      ui_set_rect(document, document_rect);
+      if (kEnableUiRects) x -= 10;
+      if (kEnableUiRects) document_rect = extend(document_rect, { x, y });
+      if (kEnableUiRects) ui_set_rect(document, document_rect);
     }
 
     id = ui_button(L"Minimize Application", []() { VERIFY(::CloseWindow(g_hwnd)); });
-    ui_set_rect(id, { .left = x, .top = y, .right = x + width, .bottom = y + height });
-    y += height;
+    if (kEnableUiRects) ui_set_rect(id, { .left = x, .top = y, .right = x + width, .bottom = y + height });
+    if (kEnableUiRects) y += height;
 
     id = ui_button(L"Close Application", []() { ::SendMessage(g_hwnd, WM_CLOSE, 0, 0); }); // A thread cannot use DestroyWindow to destroy a window created by a different thread.
-    ui_set_rect(id, { .left = x, .top = y, .right = x + width, .bottom = y + height });
-    y += height;
+    if (kEnableUiRects) ui_set_rect(id, { .left = x, .top = y, .right = x + width, .bottom = y + height });
+    if (kEnableUiRects) y += height;
     g_ui.depth_for_adding_element--;
-    x -= 10;
+    if (kEnableUiRects) x -= 10;
 
-    pane_rect = extend(pane_rect, { x, y });
-    ui_set_rect(pane, pane_rect);
+    if (kEnableUiRects) pane_rect = extend(pane_rect, { x, y });
+    if (kEnableUiRects) ui_set_rect(pane, pane_rect);
   }
   log("ui_describe: END\n");
 

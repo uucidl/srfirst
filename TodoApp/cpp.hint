@@ -1,0 +1,8 @@
+// Hint files help the Visual Studio IDE interpret Visual C++ identifiers
+// such as names of functions and macros.
+// For more information see https://go.microsoft.com/fwlink/?linkid=865984
+#define LOG_DEFINE_METHOD(cls_) void log(char const* fmt, ...) { ::log("this(%p) "##cls_ "", this); std::va_list args; va_start(args, fmt); ::logv(fmt, args); va_end(args); }
+// Hint files help the Visual Studio IDE interpret Visual C++ identifiers
+// such as names of functions and macros.
+// For more information see https://go.microsoft.com/fwlink/?linkid=865984
+#define IUNKNOWN_DEFS ULONG STDMETHODCALLTYPE AddRef() override { return ++reference_count; } ULONG STDMETHODCALLTYPE Release() override { return --reference_count; } HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override; ULONG reference_count = 1
