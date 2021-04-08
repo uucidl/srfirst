@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -78,6 +79,7 @@ struct ComOwner {
   }
 
   operator bool() { return bool(ptr); }
+  operator T* () { return ptr;  }
 
   ComOwner& operator=(const ComOwner& Other) {
     if (ptr) ptr->Release();
@@ -199,7 +201,6 @@ struct Ui {
     bool updated = false;
   } focus;
 
-
   enum Type {
     kNone,   // invalid
     kText,   // static label / paragraph
@@ -217,6 +218,11 @@ struct Ui {
   std::vector<Id>           node_parent;
   std::vector<int>          node_depth;
   std::vector<RECT>         node_rect;
+  
+  struct {
+    std::vector<Id> ids;
+    std::vector<DigitalButton> state;
+  } buttons;
 };
 
 Ui g_ui;
@@ -406,6 +412,36 @@ ui_begin() {
   auto& ui = g_ui;
   
   // for now we're recreating the structure each time, which doesn't allow detecting structural changes, which will be necessary later on.
+  /* remove buttons that no longer exist */ {
+    std::vector<Ui::Id> live_nodes = ui.node_ids;
+    std::sort(live_nodes.begin(), live_nodes.end());
+
+    std::vector<std::pair<Ui::Id, size_t>> button_nodes;
+    for (size_t i = 0; i < ui.buttons.ids.size(); i++) {
+      button_nodes.push_back({ ui.buttons.ids[i], i });
+    }
+    std::sort(button_nodes.begin(), button_nodes.end(), [](const auto& a, const auto& b) {
+      return a.first < b.first;
+    });
+
+    std::vector<std::pair<Ui::Id, size_t>> buttons_to_remove;
+    struct LessThan {
+      bool operator()(const std::pair<Ui::Id, size_t> a, const Ui::Id& b) {
+        return a.first < b;
+      }
+      bool operator()(const Ui::Id& a, const std::pair<Ui::Id, size_t> b) {
+        return a < b.first;
+      }
+    };
+
+    std::set_difference(button_nodes.begin(), button_nodes.end(), live_nodes.begin(), live_nodes.end(), std::back_inserter(buttons_to_remove), LessThan());
+    for (auto [id, index] : buttons_to_remove) {
+      VERIFY(ui.buttons.ids[index] == id);
+      ui.buttons.ids.erase(ui.buttons.ids.begin() + index);
+      ui.buttons.state.erase(ui.buttons.state.begin() + index);
+    }
+  }
+
   ui.node_ids.clear();
   ui.node_names.clear();
   ui.node_type.clear();
@@ -414,10 +450,15 @@ ui_begin() {
   ui.node_rect.clear();
 }
 
+void ui_uia_raise_events_for_updates(const Ui& ui);
+
 void
 ui_end() {
+
   // Global input handlers, such as for focus changes:
   auto& ui = g_ui;
+  VERIFY(ui.focus.id == 0 || std::ranges::end(ui.node_ids) != std::ranges::find(ui.node_ids, ui.focus.id));
+
   auto& inputs = ui.inputs;
   bool focus_next = false;
   bool focus_prev = false;
@@ -446,7 +487,13 @@ ui_end() {
     }
   }
 
-  log("UI focus: " IdFormat "%s\n", g_ui.focus.id, g_ui.focus.updated ? " (updated)" : "");
+  ui_uia_raise_events_for_updates(ui);
+
+  // reset button triggers:
+  for (auto& state : ui.buttons.state) {
+    state.pressed = false;
+    state.released = false;
+  }
   ui.focus.updated = false;
 
   inputs.updated = false;
@@ -466,7 +513,7 @@ ui_search_parent_index_for_adding(const Ui& ui) {
 }
 
 Ui::Id
-ui_named_element(wchar_t const* name, Ui::Type type) {
+ui_named_element(wchar_t const* name, Ui::Type type, wchar_t const* text) {
   auto& ui = g_ui;
   auto index = ui.node_ids.size();
   auto depth = ui.depth_for_adding_nodes;
@@ -489,7 +536,7 @@ ui_named_element(wchar_t const* name, Ui::Type type) {
   VERIFY(valid_id(id));
   VERIFY(ui.node_ids.end() == std::find(ui.node_ids.begin(), ui.node_ids.end(), id));
   ui.node_ids.push_back(id);
-  ui.node_names.push_back(name);
+  ui.node_names.push_back(text ? text : name);
   ui.node_type.push_back(type);
   ui.node_depth.push_back(depth);
   ui.node_parent.push_back(parent_id);
@@ -503,7 +550,7 @@ ui_named_element(wchar_t const* name, Ui::Type type) {
 
 Ui::Id
 ui_text_paragraph(wchar_t const* content) {
-  return ui_named_element(content, Ui::Type::kText);
+  return ui_named_element(content, Ui::Type::kText, nullptr);
 }
 
 
@@ -513,10 +560,26 @@ struct ButtonResult {
 };
 
 ButtonResult
-ui_button(wchar_t const* name) {
-  auto id = ui_named_element(name, Ui::Type::kButton);
-  if (g_ui.inputs.updated && g_ui.inputs.keys_per_vk[VK_RETURN].pressed) {
-    // TODO(nil): say that the button was activated to the accessibility clients.
+ui_button(wchar_t const* name, wchar_t const* text = nullptr) {
+  auto& ui = g_ui;
+  auto id = ui_named_element(name, Ui::Type::kButton, text);
+  
+  auto button_pos = std::find(ui.buttons.ids.begin(), ui.buttons.ids.end(), id);
+  size_t button_index;
+  if (button_pos == ui.buttons.ids.end()) {
+    button_index = ui.buttons.ids.size();
+    ui.buttons.ids.push_back(id);
+    ui.buttons.state.push_back({});
+  }
+  else {
+    button_index = std::distance(ui.buttons.ids.begin(), button_pos);
+  }
+  auto& state = ui.buttons.state[button_index];
+
+  bool is_down = g_ui.inputs.updated && g_ui.focus.id == id && g_ui.inputs.keys_per_vk[VK_RETURN].is_down;
+  ui_update(&state, is_down);
+
+  if (state.released) {
     return { id, true };
   }
   return { id, false };
@@ -524,7 +587,7 @@ ui_button(wchar_t const* name) {
 
 Ui::Id
 ui_pane_begin(wchar_t const* name) {
-  auto id = ui_named_element(name, Ui::Type::kPane);
+  auto id = ui_named_element(name, Ui::Type::kPane, nullptr);
   g_ui.depth_for_adding_nodes++;
   return id;
 }
@@ -573,7 +636,7 @@ void main_update();
 
 #define LOG_DEFINE_METHOD(cls_)          \
   void log(char const* fmt, ...) {       \
-    ::log("this(%p) " #cls_ "", this);  \
+    ::log("this(%p) " #cls_ "::", this);  \
     std::va_list args;                   \
     va_start(args, fmt);                 \
     ::logv(fmt, args);                   \
@@ -867,16 +930,22 @@ RootProvider::QueryInterface(REFIID riid, void** ppvObject) {
   COM_REQUIRE_PTR(ppvObject);
   LPOLESTR riid_string;
   VERIFYHR(::StringFromIID(riid, &riid_string));
-  log("%s %u (%ls)\n", __func__, riid.Data1, riid_string);
+  if (false) {
+    log("%s %u (%ls)\n", __func__, riid.Data1, riid_string);
+  }
 
   *ppvObject = result.second; // it's important to also assign it a value even if E_NOTINTERFACE
   if (!result.second) {
-    if (result.first) { log("  missing %s interface (not supported)\n", result.first); }
+    if (false) {
+      if (result.first) { log("  missing %s interface (not supported)\n", result.first); }
+    }
     return E_NOINTERFACE;
   }
 
   AddRef();
-  log("  supported_interface %s\n", result.first);
+  if (false) {
+    log("  supported_interface %s\n", result.first);
+  }
   return S_OK;
 }
 
@@ -900,16 +969,22 @@ AnyElementProvider::QueryInterface(REFIID riid, void** ppvObject) {
   COM_REQUIRE_PTR(ppvObject);
   LPOLESTR riid_string;
   VERIFYHR(::StringFromIID(riid, &riid_string));
-  log("%s %u (%ls)\n", __func__, riid.Data1, riid_string);
+  if (false) {
+    log("%s %u (%ls)\n", __func__, riid.Data1, riid_string);
+  }
 
   *ppvObject = result.second; // it's important to also assign it a value even if E_NOTINTERFACE
   if (!result.second) {
-    if (result.first) { log("  missing %s interface (not supported)\n", result.first); }
+    if (false) {
+      if (result.first) { log("  missing %s interface (not supported)\n", result.first); }
+    }
     return E_NOINTERFACE;
   }
 
   AddRef();
-  log("  supported_interface %s\n", result.first);
+  if (false) {
+    log("  supported_interface %s\n", result.first);
+  }
   return S_OK;
 }
 
@@ -918,6 +993,30 @@ create_element_provider(Ui::Id id) {
   return new AnyElementProvider(id);
 }
 
+
+void
+ui_uia_raise_events_for_updates(const Ui& ui) {
+  if (!::UiaClientsAreListening()) return;
+
+  if (ui.focus.updated) {
+    ComOwner p = create_element_provider(g_ui.focus.id);
+    ComOwner<IRawElementProviderSimple> sp;
+    VERIFYHR(p.QueryInterface(sp.Slot()));
+    VERIFYHR(UiaRaiseAutomationEvent(sp, UIA_AutomationFocusChangedEventId));
+  }
+
+  for (size_t i = 0; i < ui.buttons.state.size(); i++) {
+    const auto& state = ui.buttons.state[i];
+    const auto id = ui.buttons.ids[i];
+    if (state.released) {
+      // button was activated.
+      ComOwner p = create_element_provider(id);
+      ComOwner<IRawElementProviderSimple> sp;
+      VERIFYHR(p.QueryInterface(sp.Slot()));
+      UiaRaiseAutomationEvent(sp, UIA_Invoke_InvokedEventId);
+    }
+  }
+}
 
 #pragma endregion UI_UIA
 
@@ -940,16 +1039,37 @@ INT_PTR about_dlgproc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 
 void
 main_update() {
-  ui_begin();
-  if (auto pane = ui_pane_begin(L"Main")) {
-    ui_text_paragraph(L"You may close this app with the next button.");
-    if (ui_button(L"Close application.").activated) {
-      log("User requested to close the application by pressing the button.\n");
-      VERIFY(::DestroyWindow(g_ui.hwnd));
+  // Ui State:
+  static auto show_content = false;
+
+  auto content_need_refresh = true;
+  while (content_need_refresh) {
+    content_need_refresh = false;
+    ui_begin();
+    if (auto pane = ui_pane_begin(L"Main")) {
+      auto show_content_button = ui_button(L"Content Toggle", show_content ? L"Hide Content" : L"Show Content");
+      if (show_content_button.activated) { show_content = !show_content; }
+      if (show_content) {
+        auto id = ui_text_paragraph(L"Lorem ipsum...");
+        if (show_content_button.activated) {
+          ui_update_focus(g_ui, id); // focus on the content being shown for the first time...
+        }
+        if (ui_button(L"Done").activated) {
+          show_content = false;
+          ui_update_focus(g_ui, show_content_button.id);
+          content_need_refresh = true; // necessary because the name of the toggle button needs to change.
+
+        }
+      }
+      ui_text_paragraph(L"You may close this app with the next button.");
+      if (ui_button(L"Close application.").activated) {
+        log("User requested to close the application by pressing the button.\n");
+        VERIFY(::DestroyWindow(g_ui.hwnd));
+      }
+      ui_pane_end(pane);
     }
-    ui_pane_end(pane);
+    ui_end();
   }
-  ui_end();
   ui_log_structure();
 }
 
