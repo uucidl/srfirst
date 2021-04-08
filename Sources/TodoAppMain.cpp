@@ -802,7 +802,7 @@ struct AnyElementProvider : public IRawElementProviderSimple, public IRawElement
   HRESULT STDMETHODCALLTYPE Invoke() override {
     VERIFY(g_ui.node_type[ui_get_index(id)] == Ui::Type::kButton);
     ui_update_button_activate(g_ui, id);
-    main_update();
+    main_update(); // TODO(nil): TAG(UIThread): or post a message so it is pulled from the main ui thread?
     return S_OK;
   }
 
@@ -877,7 +877,7 @@ COMPLETE_SWITCH_END
   }
   HRESULT STDMETHODCALLTYPE SetFocus() override {
     ui_update_focus(g_ui, id);
-    main_update(); // TODO(nil): or post a message.
+    main_update(); // TODO(nil): TAG(UIThread): or post a message so it is pulled from the main ui thread?
     return S_OK;
   }
 
@@ -1095,7 +1095,7 @@ main_update() {
       ui_text_paragraph(L"You may close this app with the next button.");
       if (ui_button(L"Close application.").activated) {
         log("User requested to close the application by pressing the button.\n");
-        ::SendMessage(g_ui.hwnd, WM_CLOSE, 0, 0); // A thread cannot use DestroyWindow to destroy a window created by a different thread
+        ::SendMessage(g_ui.hwnd, WM_CLOSE, 0, 0); // TAG(UIThread) A thread cannot use DestroyWindow to destroy a window created by a different thread
         //VERIFY(::DestroyWindow(g_ui.hwnd));
       }
       ui_pane_end(pane);
