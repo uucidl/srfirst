@@ -194,6 +194,8 @@ struct Ui {
     bool updated = false;
     DigitalButton keys_per_vk[256];
     DigitalButton shift_key;
+
+    std::vector<Ui::Id> activated_buttons;
   } inputs;
 
   struct {
@@ -248,7 +250,7 @@ ui_get_index(Ui::Id id) {
     return fingers.index[1];
   }
 
-  log("ui_get_index finger cache miss, for id %#llx (cached ids: %#llx %#llx)\n", id, fingers.id[0], fingers.id[1]);
+  log("ui_get_index finger cache miss, for id " IdFormat "(cached ids: " IdFormat " " IdFormat ")\n", id, fingers.id[0], fingers.id[1]);
 
   size_t index;
   for (index = 0; index < g_ui.node_ids.size(); index++) {
@@ -283,6 +285,12 @@ ui_update_focus(Ui& ui, Ui::Id new_id) {
   auto old_id = ui.focus.id;
   ui.focus.id = new_id;
   ui.focus.updated = new_id != old_id;
+}
+
+void
+ui_update_button_activate(Ui& ui, Ui::Id id) {
+  ui.inputs.updated = true;
+  ui.inputs.activated_buttons.push_back(id);
 }
 
 
@@ -454,7 +462,6 @@ void ui_uia_raise_events_for_updates(const Ui& ui);
 
 void
 ui_end() {
-
   // Global input handlers, such as for focus changes:
   auto& ui = g_ui;
   VERIFY(ui.focus.id == 0 || std::ranges::end(ui.node_ids) != std::ranges::find(ui.node_ids, ui.focus.id));
@@ -472,6 +479,7 @@ ui_end() {
       ui_update_focus(ui, ui.node_ids[0]);
     } else if (focus_next) {
       log("User wants to focus the next element (keyboard)\n");
+      VERIFY(!ui.focus.updated); // focus has already been updated?
       auto index = ui_get_index(ui.focus.id);
       if (index + 1 < ui.node_ids.size()) {
         index++;
@@ -479,6 +487,7 @@ ui_end() {
       }
     } else if (focus_prev) {
       log("User wants to focus the previous element (keyboard)\n");
+      VERIFY(!ui.focus.updated); // focus has already been updated?
       auto index = ui_get_index(ui.focus.id);
       if (index > 0) {
         index--;
@@ -496,6 +505,7 @@ ui_end() {
   }
   ui.focus.updated = false;
 
+  inputs.activated_buttons.clear();
   inputs.updated = false;
   VERIFY(g_ui.depth_for_adding_nodes == 0); // Unbalanced?
 }
@@ -576,8 +586,13 @@ ui_button(wchar_t const* name, wchar_t const* text = nullptr) {
   }
   auto& state = ui.buttons.state[button_index];
 
-  bool is_down = g_ui.inputs.updated && g_ui.focus.id == id && g_ui.inputs.keys_per_vk[VK_RETURN].is_down;
+  bool is_down = g_ui.inputs.updated && (g_ui.focus.id == id && g_ui.inputs.keys_per_vk[VK_RETURN].is_down);
   ui_update(&state, is_down);
+
+  if (g_ui.inputs.updated && end(ui.inputs.activated_buttons) != std::ranges::find(ui.inputs.activated_buttons, id)) {
+    ui_update(&state, true);
+    ui_update(&state, false);
+  }
 
   if (state.released) {
     return { id, true };
@@ -780,8 +795,16 @@ COMPLETE_SWITCH_END
   IUNKNOWN_DEFS;
 };
 
-struct AnyElementProvider : public IRawElementProviderSimple, public IRawElementProviderFragment {
+struct AnyElementProvider : public IRawElementProviderSimple, public IRawElementProviderFragment, public IInvokeProvider {
   AnyElementProvider(Ui::Id id) : id(id) {}
+
+  // IInvokeProvider
+  HRESULT STDMETHODCALLTYPE Invoke() override {
+    VERIFY(g_ui.node_type[ui_get_index(id)] == Ui::Type::kButton);
+    ui_update_button_activate(g_ui, id);
+    main_update();
+    return S_OK;
+  }
 
   // IRawElementProviderFragment
   HRESULT STDMETHODCALLTYPE get_BoundingRectangle(UiaRect* pRetVal) override {
@@ -868,6 +891,14 @@ COMPLETE_SWITCH_END
   }
   HRESULT STDMETHODCALLTYPE GetPatternProvider(PATTERNID patternId, IUnknown** pRetVal) override {
     COM_REQUIRE_PTR(pRetVal);
+
+    auto this_index = ui_get_index(id);
+    switch (patternId) {
+    case UIA_InvokePatternId: {
+      return this->QueryInterface(IID_IInvokeProvider, (void**)pRetVal);
+    } break;
+    }
+
     // TODO(nil): implement button
     return S_OK;
   }
@@ -955,6 +986,7 @@ AnyElementProvider::QueryInterface(REFIID riid, void** ppvObject) {
     // supported interfaces:
     if (riid == IID_IRawElementProviderSimple) return { "IRawElementProviderSimple", static_cast<IRawElementProviderSimple*>(this) };
     if (riid == IID_IRawElementProviderFragment) return { "IRawElementProviderFragment", static_cast<IRawElementProviderFragment*>(this) };
+    if (riid == IID_IInvokeProvider && g_ui.node_type[ui_get_index(this->id)] == Ui::Type::kButton) return { "IInvokeProvider", static_cast<IInvokeProvider*>(this) };
     // not supported, but logged
     if (riid == IID_IAccIdentity) return { "IAccIdentity", nullptr };
 
@@ -1042,7 +1074,7 @@ main_update() {
   // Ui State:
   static auto show_content = false;
 
-  auto content_need_refresh = true;
+  auto content_need_refresh = true; // The loop is not necessary if we explicitely have two phases: event handling and content display. (as long as we ensure that ids are stable across the two phases, like for instance for a button that could change label when toggled)
   while (content_need_refresh) {
     content_need_refresh = false;
     ui_begin();
@@ -1058,13 +1090,13 @@ main_update() {
           show_content = false;
           ui_update_focus(g_ui, show_content_button.id);
           content_need_refresh = true; // necessary because the name of the toggle button needs to change.
-
         }
       }
       ui_text_paragraph(L"You may close this app with the next button.");
       if (ui_button(L"Close application.").activated) {
         log("User requested to close the application by pressing the button.\n");
-        VERIFY(::DestroyWindow(g_ui.hwnd));
+        ::SendMessage(g_ui.hwnd, WM_CLOSE, 0, 0); // A thread cannot use DestroyWindow to destroy a window created by a different thread
+        //VERIFY(::DestroyWindow(g_ui.hwnd));
       }
       ui_pane_end(pane);
     }
