@@ -163,7 +163,14 @@ struct RootProvider : public IRawElementProviderSimple
 
   // IUnknown interface:
   ULONG STDMETHODCALLTYPE AddRef() override { return ++reference_count; }
-  ULONG STDMETHODCALLTYPE Release() override { return --reference_count; }
+  ULONG STDMETHODCALLTYPE Release() override {
+    if (reference_count == 1) {
+      delete this;
+      return 0;
+    }
+    VERIFY(reference_count > 1);
+    return --reference_count;
+  }
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
 
   ULONG reference_count = 1;
@@ -738,7 +745,14 @@ struct AnyElementProvider : public IRawElementProviderSimple, public IRawElement
 
   // IUnknown interface:
   ULONG STDMETHODCALLTYPE AddRef() override { return ++reference_count; }
-  ULONG STDMETHODCALLTYPE Release() override { return --reference_count; }
+  ULONG STDMETHODCALLTYPE Release() override {
+    if (reference_count == 1) {
+      delete this;
+      return 0;
+    }
+    VERIFY(reference_count > 1);
+    return --reference_count;
+  }
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
 
   void log(char const* fmt, ...) {
@@ -1128,6 +1142,8 @@ AnyElementProvider::SetFocus() {
 }
 
 struct AnyElementValueProvider : public IValueProvider {
+  ProviderInstanceTracker tracker;
+
   // IValueProvider:
   HRESULT STDMETHODCALLTYPE get_IsReadOnly(BOOL* pRetVal);
   // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nf-uiautomationcore-ivalueprovider-get_isreadonly)
@@ -1138,7 +1154,14 @@ struct AnyElementValueProvider : public IValueProvider {
 
   // IUnknown interface:
   ULONG STDMETHODCALLTYPE AddRef() override { return ++reference_count; }
-  ULONG STDMETHODCALLTYPE Release() override { return --reference_count; }
+  ULONG STDMETHODCALLTYPE Release() override { 
+    if (reference_count == 1) {
+      delete this;
+      return 0;
+    }
+    VERIFY(reference_count > 1);
+    return --reference_count;
+  }
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
 
   void log(char const* fmt, ...) {
@@ -1210,6 +1233,8 @@ AnyElementValueProvider::QueryInterface(REFIID riid, void** ppvObject) {
 
 
 struct AnyElementTextProvider : public ITextProvider {
+  ProviderInstanceTracker tracker;
+
   // ITextProvider
   HRESULT STDMETHODCALLTYPE get_DocumentRange(ITextRangeProvider** pRetVal) override;
   HRESULT STDMETHODCALLTYPE get_SupportedTextSelection(SupportedTextSelection* pRetVal) override;
@@ -1220,7 +1245,14 @@ struct AnyElementTextProvider : public ITextProvider {
 
   // IUnknown interface:
   ULONG STDMETHODCALLTYPE AddRef() override { return ++reference_count; }
-  ULONG STDMETHODCALLTYPE Release() override { return --reference_count; }
+  ULONG STDMETHODCALLTYPE Release() override {
+    if (reference_count == 1) {
+      delete this;
+      return 0;
+    }
+    VERIFY(reference_count > 1);
+    return --reference_count;
+  }
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
 
   void log(char const* fmt, ...) {
@@ -1361,7 +1393,14 @@ struct AnyElementTextRangeProvider : public ITextRangeProvider {
 
   // IUnknown interface:
   ULONG STDMETHODCALLTYPE AddRef() override { return ++reference_count; }
-  ULONG STDMETHODCALLTYPE Release() override { return --reference_count; }
+  ULONG STDMETHODCALLTYPE Release() override {
+    if (reference_count == 1) {
+      delete this;
+      return 0;
+    }
+    VERIFY(reference_count > 1);
+    return --reference_count;
+  }
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
 
   void log(char const* fmt, ...) {
@@ -1866,7 +1905,14 @@ struct AnyElementInvokeProvider : public IInvokeProvider {
 
   // IUnknown interface:
   ULONG STDMETHODCALLTYPE AddRef() override { return ++reference_count; }
-  ULONG STDMETHODCALLTYPE Release() override { return --reference_count; }
+  ULONG STDMETHODCALLTYPE Release() override {
+    if (reference_count == 1) {
+      delete this;
+      return 0;
+    }
+    VERIFY(reference_count > 1);
+    return --reference_count;
+  }
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
 
   void log(char const* fmt, ...) {
