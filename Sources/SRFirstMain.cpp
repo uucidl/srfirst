@@ -178,6 +178,7 @@ struct RootProvider : public IRawElementProviderSimple
 
 static HWND g_hwnd;
 static RootProvider* g_root_provider;
+static int g_num_active_providers = 0;
 
 enum MenuId : UINT {
   MenuId_None,
@@ -327,15 +328,21 @@ wWinMain(
     ::DispatchMessageW(&msg);
   }
 end:
-  VERIFYHR(::UiaDisconnectAllProviders());
+  log("end: num_active_providers: %d\n", g_num_active_providers);
   for (auto& x : g_ui.providers) {
-    VERIFY(x.second->Release() == 0);
+    x.second->Release();
   }
+  log("after_releasing_cache: num_active_providers: %d\n", g_num_active_providers);
+  VERIFYHR(::UiaDisconnectAllProviders());
+  log("after_uia_disconnect: num_active_providers: %d\n", g_num_active_providers);
   if (g_root_provider) {
       VERIFY(g_root_provider->Release() == 0);
       g_root_provider = nullptr;
   }
+  log("after_releasing_root: num_active_providers: %d\n", g_num_active_providers);
   ::CoUninitialize();
+  log("after_com_uninit: num_active_providers: %d\n", g_num_active_providers);
+  VERIFY(g_num_active_providers == 0);
   log("END: Ended.\n");
   return 0;
 }
@@ -728,7 +735,21 @@ RootProvider::ElementProviderFromPoint(double x, double y, IRawElementProviderFr
   return S_OK;
 }
 
+struct ProviderInstanceTracker
+{
+  ProviderInstanceTracker() { 
+    g_num_active_providers++;
+    log("one new instance %p\n", (void*) this);
+  }
+  ~ProviderInstanceTracker() { 
+    g_num_active_providers--; 
+    log("one less instance %p\n", (void*)this);
+  }
+};
+
 struct AnyElementProvider : public IRawElementProviderSimple, public IRawElementProviderFragment {
+  ProviderInstanceTracker tracker;
+
   // IRawElementProviderFragment
   HRESULT STDMETHODCALLTYPE get_BoundingRectangle(UiaRect* pRetVal) override;
   HRESULT STDMETHODCALLTYPE get_FragmentRoot(IRawElementProviderFragmentRoot** pRetVal) override;
@@ -1370,6 +1391,8 @@ AnyElementTextProvider::RangeFromPoint(UiaPoint point, ITextRangeProvider** pRet
 }
 
 struct AnyElementTextRangeProvider : public ITextRangeProvider {
+  ProviderInstanceTracker tracker;
+
   // ITextRangeProvider:
   // URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/nn-uiautomationcore-itextrangeprovider?f1url=%3FappId%3DDev16IDEF1%26l%3DEN-US%26k%3Dk(UIAUTOMATIONCORE%252FITextRangeProvider);k(ITextRangeProvider);k(DevLang-C%252B%252B);k(TargetOS-Windows)%26rd%3Dtrue)
   HRESULT STDMETHODCALLTYPE AddToSelection() override;
@@ -1900,6 +1923,8 @@ AnyElementTextRangeProvider::QueryInterface(REFIID riid, void** ppvObject) {
 }
 
 struct AnyElementInvokeProvider : public IInvokeProvider {
+  ProviderInstanceTracker tracker;
+
   // IInvokeProvider interface:
   HRESULT STDMETHODCALLTYPE Invoke() override;
 
