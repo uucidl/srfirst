@@ -3,6 +3,28 @@
 // An experiment in designing an app starting first from screen-reader support, before thinking about the GUI.
 //
 
+// TODO(nil): Implement structural change events, because when content is hidden when pressing the [Done]
+// button we have GetPropertyValue calls being made just after activation on nodes that don't exist yet.
+// Rather than turning those providers into "Null" providers, I need to implement structural change events.
+//
+// See:
+// - URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcoreapi/nf-uiautomationcoreapi-uiaraisestructurechangedevent)
+// - URL(https://docs.microsoft.com/en-us/windows/win32/api/uiautomationcore/ne-uiautomationcore-structurechangetype)
+// 
+// Some ideas:
+// 0- add the root element in the hierarchy of the Ui tree and merge the AnyElementProvider with the
+// RootProvider. That way I internalize the peculiarities about the root node in the providers, but
+// make everything more uniform in terms of tree manipulation code. I.e. elements at depth 0 are
+// actually at depth 1 and all have a back pointer to the root. The root is always there, so its
+// addition code is straightforward.
+//
+// 1- synthesize structure change events. I imagine I could do that while elements get added to the
+// tree by detecting if they were already there. If they aren't then we can mark them as new, and
+// their parent can be marked as having seen a bulk children added. However how do I remove children?
+// What if the children are not new but reordered?
+// 
+// Another approach would be to double-buffer the tree and somehow compare the old with the new.
+
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -220,7 +242,7 @@ struct Ui {
   std::vector<Id>           node_parent;
   std::vector<int>          node_depth;
   std::vector<RECT>         node_rect;
-  
+
   struct {
     std::vector<Id> ids;
     std::vector<DigitalButton> state;
