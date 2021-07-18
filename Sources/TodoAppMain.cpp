@@ -591,18 +591,11 @@ ui_button(wchar_t const* name, wchar_t const* text = nullptr) {
   }
   auto& state = ui.buttons.state[button_index];
 
-  bool is_down = g_ui.inputs.updated && (g_ui.focus.id == id && g_ui.inputs.keys_per_vk[VK_RETURN].is_down);
-  ui_update(&state, is_down);
+  const auto& inputs = ui.inputs;
 
-  if (g_ui.inputs.updated && end(ui.inputs.activated_buttons) != std::ranges::find(ui.inputs.activated_buttons, id)) {
-    ui_update(&state, true);
-    ui_update(&state, false);
-  }
-
-  if (state.released) {
-    return { id, true };
-  }
-  return { id, false };
+  const auto activated = inputs.updated &&
+    ((ui.focus.id == id && inputs.keys_per_vk[VK_RETURN].pressed) || end(inputs.activated_buttons) != std::ranges::find(inputs.activated_buttons, id));
+  return { id, activated };
 }
 
 Ui::Id
