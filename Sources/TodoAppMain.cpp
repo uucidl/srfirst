@@ -243,10 +243,15 @@ ui_get_index(Ui::Id id) {
   } fingers = {};
   static int next = 0;
 
-  if (id == fingers.id[0]) {
+  const auto cache_hit = [](Ui::Id id, int i) {
+    auto index = fingers.index[i];
+    return id == fingers.id[i] && index < g_ui.node_ids.size() && g_ui.node_ids[index] == id;
+  };
+
+  if (cache_hit(id, 0)) {
     return fingers.index[0];
   }
-  else if (id == fingers.id[1]) {
+  else if (cache_hit(id, 1)) {
     return fingers.index[1];
   }
 
